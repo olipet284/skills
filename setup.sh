@@ -150,20 +150,42 @@ if (( ${#selected_agents[@]} == 0 )); then
   exit 0
 fi
 
+is_linked_to_source_for_selected_agents() {
+  local source="$1"
+  local name="$2"
+  local agent destination
+  for agent in "${selected_agents[@]}"; do
+    destination="$(agent_root "$agent")/$name"
+    if [[ -L "$destination" && "$(readlink "$destination")" == "$source" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 selected_sources=()
 selected_names=()
 selected_descriptions=()
 for group in "${group_names[@]}"; do
   labels=()
   indices=()
+  preselected_labels=()
   for i in "${!all_names[@]}"; do
     if [[ "${all_groups[$i]}" == "$group" ]]; then
-      labels+=("${all_names[$i]} — ${all_descriptions[$i]}")
+      label="${all_names[$i]} — ${all_descriptions[$i]}"
+      labels+=("$label")
       indices+=("$i")
+      if is_linked_to_source_for_selected_agents "${all_sources[$i]}" "${all_names[$i]}"; then
+        preselected_labels+=("$label")
+      fi
     fi
   done
   (( ${#labels[@]} > 0 )) || continue
-  selection="$(gum choose --no-limit --selected='*' --header="skills/$group" "${labels[@]}")" || {
+  selection_args=()
+  for label in "${preselected_labels[@]}"; do
+    selection_args+=(--selected "$label")
+  done
+  selection="$(GUM_CHOOSE_SELECTED= gum choose --no-limit --header="skills/$group" "${selection_args[@]}" "${labels[@]}")" || {
     echo "Skill selection cancelled; nothing changed." >&2
     exit 1
   }
@@ -215,6 +237,47 @@ desired_source_for_path() {
         return 0
       fi
     done
+  done
+  return 1
+}
+
+is_managed_link_path() {
+  local candidate="$1"
+  local record_type path link_target
+  [[ -f "$state_file" ]] || return 1
+  while IFS=$'\t' read -r record_type path; do
+    [[ "$record_type" == link && "$path" == "$candidate" && -L "$path" ]] || continue
+    link_target="$(readlink "$path")"
+    case "$link_target" in
+      "$skills_root"/*) return 0 ;;
+    esac
+  done < "$state_file"
+  return 1
+}
+
+approved_overwrites=()
+for agent in "${selected_agents[@]}"; do
+  install_root="$(agent_root "$agent")"
+  for i in "${!selected_sources[@]}"; do
+    destination="$install_root/${selected_names[$i]}"
+    [[ -e "$destination" || -L "$destination" ]] || continue
+    if [[ -L "$destination" && "$(readlink "$destination")" == "${selected_sources[$i]}" ]]; then
+      continue
+    fi
+    if is_managed_link_path "$destination"; then
+      continue
+    fi
+    if gum confirm --affirmative='Overwrite' --negative='Keep' "Overwrite existing $agent skill '${selected_names[$i]}' at $destination?"; then
+      approved_overwrites+=("$destination")
+    fi
+  done
+done
+
+is_overwrite_approved() {
+  local candidate="$1"
+  local approved
+  for approved in "${approved_overwrites[@]}"; do
+    [[ "$approved" == "$candidate" ]] && return 0
   done
   return 1
 }
@@ -311,11 +374,13 @@ for agent in "${selected_agents[@]}"; do
     destination="$install_root/$name"
     if [[ -e "$destination" || -L "$destination" ]]; then
       if [[ -L "$destination" && "$(readlink "$destination")" == "$source" ]]; then
-        echo "$agent: already linked $name"
+        continue
+      elif is_overwrite_approved "$destination"; then
+        rm -rf "$destination"
       else
         echo "$agent: keeping existing $destination" >&2
+        continue
       fi
-      continue
     fi
     if ln -s "$source" "$destination"; then
       printf 'link\t%s\n' "$destination" >> "$state_file"
@@ -330,6 +395,7 @@ found_external=false
 for agent in "${agents[@]}"; do
   install_root="$(agent_root "$agent")"
   [[ -d "$install_root" ]] || continue
+  external_skills=()
   for installed_skill in "$install_root"/*; do
     [[ -f "$installed_skill/SKILL.md" ]] || continue
     installed_name="$(basename "$installed_skill")"
@@ -338,9 +404,13 @@ for agent in "${agents[@]}"; do
       [[ "$name" == "$installed_name" ]] && found_in_repo=true
     done
     if [[ "$found_in_repo" == false ]]; then
-      printf '  %s: %s\n' "$agent" "$installed_name"
-      found_external=true
+      external_skills+=("$installed_name")
     fi
   done
+  if (( ${#external_skills[@]} > 0 )); then
+    printf '%s:\n' "$agent"
+    printf '  - %s\n' "${external_skills[@]}"
+    found_external=true
+  fi
 done
 [[ "$found_external" == true ]] || echo "  none"
