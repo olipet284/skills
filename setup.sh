@@ -8,8 +8,13 @@ if ! command -v gum >/dev/null 2>&1; then
   echo "gum is required. Install it from https://github.com/charmbracelet/gum and rerun setup.sh." >&2
   exit 1
 fi
-if ! gum choose --help 2>&1 | grep -- '--selected' >/dev/null; then
+gum_help="$(gum choose --help 2>&1 || true)"
+if ! grep -q -- '--selected' <<< "$gum_help"; then
   echo "gum 0.7 or newer is required for preselected choices." >&2
+  exit 1
+fi
+if ! grep -q -- '--label-delimiter' <<< "$gum_help"; then
+  echo "gum with --label-delimiter support is required." >&2
   exit 1
 fi
 if [[ ! -d "$skills_root" ]]; then
@@ -28,6 +33,21 @@ agent_root() {
     CoCo)    printf '%s/.snowflake/cortex/skills' "$HOME" ;;
     OpenCode) printf '%s/.config/opencode/skills' "$HOME" ;;
   esac
+}
+
+join_by() {
+  local sep="$1"
+  shift
+  local first=1 out="" item
+  for item in "$@"; do
+    if (( first )); then
+      out="$item"
+      first=0
+    else
+      out="$out$sep$item"
+    fi
+  done
+  printf '%s' "$out"
 }
 
 skill_metadata() {
@@ -93,51 +113,65 @@ skill_metadata() {
   ' "$1"
 }
 
-group_names=()
-all_skill_dirs=()
-all_groups=()
+declare -A source_by_name=()
+declare -A description_by_name=()
 all_sources=()
 all_names=()
 all_descriptions=()
 
 for group_dir in "$skills_root"/*/; do
   [[ -d "$group_dir" ]] || continue
-  group="$(basename "$group_dir")"
-  group_has_skills=false
   for skill_dir in "$group_dir"*/; do
     skill_file="$skill_dir/SKILL.md"
     [[ -f "$skill_file" ]] || continue
     skill_dir="${skill_dir%/}"
-    all_skill_dirs+=("$skill_dir")
     metadata="$(skill_metadata "$skill_file")"
     IFS=$'\t' read -r name description <<< "$metadata"
     if [[ -z "$name" || -z "$description" || ! "$name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
       echo "Skipping $skill_file: valid name and description frontmatter are required." >&2
       continue
     fi
-    for existing_name in "${all_names[@]}"; do
-      if [[ "$existing_name" == "$name" ]]; then
-        echo "Duplicate skill name '$name'; skill names must be unique across groups." >&2
-        exit 1
-      fi
-    done
-    if [[ "$group_has_skills" == false ]]; then
-      group_names+=("$group")
-      group_has_skills=true
+    if [[ -n "${source_by_name[$name]:-}" ]]; then
+      echo "Duplicate skill name '$name'; skill names must be unique across groups." >&2
+      exit 1
     fi
-    all_groups+=("$group")
+    source_by_name[$name]="$skill_dir"
+    description_by_name[$name]="$description"
     all_sources+=("$skill_dir")
     all_names+=("$name")
     all_descriptions+=("$description")
   done
 done
 
-if (( ${#all_sources[@]} == 0 )); then
+if (( ${#all_names[@]} == 0 )); then
   echo "No usable skills found under $skills_root." >&2
   exit 1
 fi
 
-agent_selection="$(gum choose --no-limit --selected='*' --header='Select coding agents' "${agents[@]}")" || {
+# A skill counts as installed for an agent only when its folder is a symlink
+# pointing at this worktree's copy of that skill.
+is_installed() {
+  local agent="$1" name="$2"
+  local expected="${source_by_name[$name]:-}" dest
+  [[ -n "$expected" ]] || return 1
+  dest="$(agent_root "$agent")/$name"
+  [[ -L "$dest" && "$(readlink -- "$dest" 2>/dev/null)" == "$expected" ]]
+}
+
+mode_label="$(env -u GUM_CHOOSE_SELECTED gum choose --header='What do you want to do?' 'Install skills' 'Uninstall skills')" || {
+  echo "Action selection cancelled; nothing changed." >&2
+  exit 1
+}
+case "$mode_label" in
+  'Install skills') mode=install ;;
+  'Uninstall skills') mode=uninstall ;;
+  *)
+    echo "Unknown action '$mode_label'; nothing changed." >&2
+    exit 1
+    ;;
+esac
+
+agent_selection="$(env -u GUM_CHOOSE_SELECTED gum choose --no-limit --selected='*' --header='Select coding agents' "${agents[@]}")" || {
   echo "Agent selection cancelled; nothing changed." >&2
   exit 1
 }
@@ -149,179 +183,94 @@ if (( ${#selected_agents[@]} == 0 )); then
   echo "No agents selected; nothing changed."
   exit 0
 fi
+agents_label="$(join_by ', ' "${selected_agents[@]}")"
 
-is_linked_to_source_for_selected_agents() {
-  local source="$1"
-  local name="$2"
-  local agent destination
+# Candidates come from what is on disk right now, so a second run naturally
+# excludes whatever the previous run installed.
+options=()
+for name in "${all_names[@]}"; do
+  installed_agents=()
+  missing_agents=()
   for agent in "${selected_agents[@]}"; do
-    destination="$(agent_root "$agent")/$name"
-    if [[ -L "$destination" && "$(readlink "$destination")" == "$source" ]]; then
-      return 0
+    if is_installed "$agent" "$name"; then
+      installed_agents+=("$agent")
+    else
+      missing_agents+=("$agent")
     fi
   done
-  return 1
-}
-
-selected_sources=()
-selected_names=()
-selected_descriptions=()
-for group in "${group_names[@]}"; do
-  labels=()
-  indices=()
-  preselected_labels=()
-  for i in "${!all_names[@]}"; do
-    if [[ "${all_groups[$i]}" == "$group" ]]; then
-      label="${all_names[$i]} — ${all_descriptions[$i]}"
-      labels+=("$label")
-      indices+=("$i")
-      if is_linked_to_source_for_selected_agents "${all_sources[$i]}" "${all_names[$i]}"; then
-        preselected_labels+=("$label")
-      fi
-    fi
-  done
-  (( ${#labels[@]} > 0 )) || continue
-  selection_args=()
-  for label in "${preselected_labels[@]}"; do
-    selection_args+=(--selected "$label")
-  done
-  selection="$(GUM_CHOOSE_SELECTED= gum choose --no-limit --header="skills/$group" "${selection_args[@]}" "${labels[@]}")" || {
-    echo "Skill selection cancelled; nothing changed." >&2
-    exit 1
-  }
-  while IFS= read -r label; do
-    [[ -n "$label" ]] || continue
-    for j in "${!labels[@]}"; do
-      if [[ "${labels[$j]}" == "$label" ]]; then
-        index="${indices[$j]}"
-        selected_sources+=("${all_sources[$index]}")
-        selected_names+=("${all_names[$index]}")
-        selected_descriptions+=("${all_descriptions[$index]}")
-        break
-      fi
-    done
-  done <<< "$selection"
-done
-
-if (( ${#selected_sources[@]} == 0 )); then
-  echo "No skills selected; existing installations were left unchanged."
-  exit 0
-fi
-
-is_known_install_path() {
-  local candidate="$1"
-  local agent root
-  for agent in "${agents[@]}"; do
-    root="$(agent_root "$agent")"
-    case "$candidate" in
-      "$root"/*) return 0 ;;
-    esac
-  done
-  return 1
-}
-
-repo_key="$(printf '%s' "$repo_root" | cksum | awk '{print $1}')"
-state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/personal-skills"
-mkdir -p "$state_dir"
-state_file="$state_dir/$repo_key.links"
-next_state_file="$(mktemp "$state_dir/$repo_key.links.XXXXXX")"
-
-desired_source_for_path() {
-  local candidate="$1"
-  local agent root i
-  for agent in "${selected_agents[@]}"; do
-    root="$(agent_root "$agent")"
-    for i in "${!selected_sources[@]}"; do
-      if [[ "$candidate" == "$root/${selected_names[$i]}" ]]; then
-        printf '%s' "${selected_sources[$i]}"
-        return 0
-      fi
-    done
-  done
-  return 1
-}
-
-is_managed_link_path() {
-  local candidate="$1"
-  local record_type path link_target
-  [[ -f "$state_file" ]] || return 1
-  while IFS=$'\t' read -r record_type path; do
-    [[ "$record_type" == link && "$path" == "$candidate" && -L "$path" ]] || continue
-    link_target="$(readlink "$path")"
-    case "$link_target" in
-      "$skills_root"/*) return 0 ;;
-    esac
-  done < "$state_file"
-  return 1
-}
-
-approved_overwrites=()
-for agent in "${selected_agents[@]}"; do
-  install_root="$(agent_root "$agent")"
-  for i in "${!selected_sources[@]}"; do
-    destination="$install_root/${selected_names[$i]}"
-    [[ -e "$destination" || -L "$destination" ]] || continue
-    if [[ -L "$destination" && "$(readlink "$destination")" == "${selected_sources[$i]}" ]]; then
-      continue
-    fi
-    if is_managed_link_path "$destination"; then
-      continue
-    fi
-    if gum confirm --affirmative='Overwrite' --negative='Keep' "Overwrite existing $agent skill '${selected_names[$i]}' at $destination?"; then
-      approved_overwrites+=("$destination")
-    fi
-  done
-done
-
-is_overwrite_approved() {
-  local candidate="$1"
-  local approved
-  for approved in "${approved_overwrites[@]}"; do
-    [[ "$approved" == "$candidate" ]] && return 0
-  done
-  return 1
-}
-
-if [[ -f "$state_file" ]]; then
-  while IFS=$'\t' read -r record_type path; do
-    [[ "$record_type" == link && -n "$path" ]] || continue
-    is_known_install_path "$path" || continue
-    [[ -L "$path" ]] || continue
-    link_target="$(readlink "$path")"
-    case "$link_target" in
-      "$skills_root"/*)
-        if desired_source="$(desired_source_for_path "$path")" && [[ "$desired_source" == "$link_target" ]]; then
-          printf 'link\t%s\n' "$path" >> "$next_state_file"
-        else
-          rm -f "$path"
-        fi
-        ;;
-    esac
-  done < "$state_file"
-fi
-mv "$next_state_file" "$state_file"
-
-codex_selected=false
-for agent in "${selected_agents[@]}"; do
-  [[ "$agent" == Codex ]] && codex_selected=true
-done
-
-is_selected_source() {
-  local source="$1"
-  local selected
-  for selected in "${selected_sources[@]}"; do
-    [[ "$selected" == "$source" ]] && return 0
-  done
-  return 1
-}
-
-for skill_dir in "${all_skill_dirs[@]}"; do
-  yaml_file="$skill_dir/agents/openai.yaml"
-  [[ -f "$yaml_file" && ! -L "$yaml_file" ]] || continue
-  grep -Fqx '# Generated by setup.sh' "$yaml_file" || continue
-  if [[ "$codex_selected" == false ]] || ! is_selected_source "$skill_dir"; then
-    rm -f "$yaml_file"
+  description="${description_by_name[$name]}"
+  if [[ "$mode" == install ]]; then
+    (( ${#missing_agents[@]} > 0 )) || continue
+    label="${name} — ${description} — missing: $(join_by ', ' "${missing_agents[@]}")"
+  else
+    (( ${#installed_agents[@]} > 0 )) || continue
+    label="${name} — ${description} — installed in: $(join_by ', ' "${installed_agents[@]}")"
   fi
+  options+=("${label}::${name}")
+done
+
+selected_names=()
+if (( ${#options[@]} == 0 )); then
+  if [[ "$mode" == install ]]; then
+    echo "Nothing to install: every repo skill is already installed in the selected agents."
+  else
+    echo "Nothing to uninstall: no managed links found in the selected agents."
+  fi
+else
+  if [[ "$mode" == install ]]; then
+    header="Install skills into: $agents_label"
+    chosen="$(env -u GUM_CHOOSE_SELECTED gum choose --no-limit --selected='*' --label-delimiter='::' --header="$header" "${options[@]}")" || {
+      echo "Skill selection cancelled; nothing changed." >&2
+      exit 1
+    }
+  else
+    header="Uninstall skills from: $agents_label"
+    chosen="$(env -u GUM_CHOOSE_SELECTED gum choose --no-limit --label-delimiter='::' --header="$header" "${options[@]}")" || {
+      echo "Skill selection cancelled; nothing changed." >&2
+      exit 1
+    }
+  fi
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && selected_names+=("$name")
+  done <<< "$chosen"
+fi
+
+for name in "${selected_names[@]}"; do
+  source="${source_by_name[$name]:-}"
+  if [[ -z "$source" ]]; then
+    echo "Skipping unknown skill '$name'." >&2
+    continue
+  fi
+  for agent in "${selected_agents[@]}"; do
+    install_root="$(agent_root "$agent")"
+    destination="$install_root/$name"
+    if [[ "$mode" == install ]]; then
+      if is_installed "$agent" "$name"; then
+        continue
+      fi
+      if [[ -e "$destination" || -L "$destination" ]]; then
+        if gum confirm --affirmative='Overwrite' --negative='Keep' "Overwrite existing $agent skill '$name' at $destination?"; then
+          rm -rf -- "$destination"
+        else
+          echo "$agent: keeping existing $destination" >&2
+          continue
+        fi
+      fi
+      mkdir -p "$install_root"
+      if ln -s -- "$source" "$destination"; then
+        echo "$agent: linked $name"
+      else
+        echo "$agent: could not link $name to $destination" >&2
+      fi
+    else
+      if is_installed "$agent" "$name"; then
+        rm -f -- "$destination"
+        echo "$agent: unlinked $name"
+      elif [[ -e "$destination" || -L "$destination" ]]; then
+        echo "$agent: leaving unmanaged $destination" >&2
+      fi
+    fi
+  done
 done
 
 yaml_quote() {
@@ -359,37 +308,33 @@ generate_openai_yaml() {
   mv "$temp_file" "$yaml_file"
 }
 
-if [[ "$codex_selected" == true ]]; then
-  for i in "${!selected_sources[@]}"; do
-    generate_openai_yaml "${selected_sources[$i]}" "${selected_names[$i]}" "${selected_descriptions[$i]}"
-  done
-fi
-
-for agent in "${selected_agents[@]}"; do
-  install_root="$(agent_root "$agent")"
-  mkdir -p "$install_root"
-  for i in "${!selected_sources[@]}"; do
-    source="${selected_sources[$i]}"
-    name="${selected_names[$i]}"
-    destination="$install_root/$name"
-    if [[ -e "$destination" || -L "$destination" ]]; then
-      if [[ -L "$destination" && "$(readlink "$destination")" == "$source" ]]; then
-        continue
-      elif is_overwrite_approved "$destination"; then
-        rm -rf "$destination"
-      else
-        echo "$agent: keeping existing $destination" >&2
-        continue
-      fi
-    fi
-    if ln -s "$source" "$destination"; then
-      printf 'link\t%s\n' "$destination" >> "$state_file"
-    else
-      echo "$agent: could not link $name to $destination" >&2
-    fi
-  done
+for i in "${!all_names[@]}"; do
+  name="${all_names[$i]}"
+  source="${all_sources[$i]}"
+  yaml_file="$source/agents/openai.yaml"
+  if is_installed Codex "$name"; then
+    generate_openai_yaml "$source" "$name" "${all_descriptions[$i]}"
+  elif [[ -f "$yaml_file" && ! -L "$yaml_file" ]] && grep -Fqx '# Generated by setup.sh' "$yaml_file"; then
+    rm -f -- "$yaml_file"
+  fi
 done
 
+echo
+echo "Skills missing from some agent folders:"
+found_gap=false
+for name in "${all_names[@]}"; do
+  gaps=()
+  for agent in "${agents[@]}"; do
+    is_installed "$agent" "$name" || gaps+=("$agent")
+  done
+  if (( ${#gaps[@]} > 0 )); then
+    printf '  %s: missing in %s\n' "$name" "$(join_by ', ' "${gaps[@]}")"
+    found_gap=true
+  fi
+done
+[[ "$found_gap" == true ]] || echo "  none — every skill is installed in all agents"
+
+echo
 echo "Installed skills not found in this repo:"
 found_external=false
 for agent in "${agents[@]}"; do
@@ -400,9 +345,7 @@ for agent in "${agents[@]}"; do
     [[ -f "$installed_skill/SKILL.md" ]] || continue
     installed_name="$(basename "$installed_skill")"
     found_in_repo=false
-    for name in "${all_names[@]}"; do
-      [[ "$name" == "$installed_name" ]] && found_in_repo=true
-    done
+    [[ -n "${source_by_name[$installed_name]:-}" ]] && found_in_repo=true
     if [[ "$found_in_repo" == false ]]; then
       external_skills+=("$installed_name")
     fi
